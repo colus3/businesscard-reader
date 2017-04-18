@@ -240,17 +240,16 @@ vector<Point> compute(vector<Point> points, float (*func)(float, float)) {
     Point minPoint, maxPoint;
     min = 0; max = 0;
     for ( auto point : points ) {
-        float sum = func(point.x, point.y);
-        if ( min == 0 || min > sum ) {
+        float value = func(point.x, point.y);
+        if ( min == 0 || min > value ) {
             minPoint = point;
-            min = sum;
+            min = value;
         }
-        if ( max == 0 || max < sum ) {
+        if ( max == 0 || max < value ) {
             maxPoint = point;
-            max = sum;
+            max = value;
         }
     }
-    cout << "min : " << minPoint << " max : " << maxPoint << endl;
 
     result.emplace_back(minPoint);
     result.emplace_back(maxPoint);
@@ -274,34 +273,32 @@ vector<Point> order_points(vector<Point> points) {
     // now, compute the difference between the points, the
     // top-right point will have the smallest difference,
     // whereas the bottom-left will have the largest difference
-    vector<Point> diff = compute(points, [](float a, float b) { return a - b; });
+    vector<Point> diff = compute(points, [](float a, float b) { return b - a; });
 
     rect.emplace_back(sum[0]);
     rect.emplace_back(diff[0]);
     rect.emplace_back(sum[1]);
     rect.emplace_back(diff[1]);
 
-    cout << "rect : " << rect << endl;
-    // return the ordered coordinates
     return rect;
 }
 
 void auto_scan_image() {
     Mat image, orig, gray, edged;
-    Mat warp_mat, warp_dst;
+    Mat warpMat, warped;
     vector<vector<Point>> contours, contours2;
     vector<Point> screenContour, rect;
-    Point topLeft, topRight, bottomRight, bottomLeft;
+    Point2f topLeft, topRight, bottomRight, bottomLeft;
     Point2f pts1[4], pts2[4];
 
-    float w1, w2, h1, h2, maxWidth, maxHeight;
+    float r, w1, w2, h1, h2, maxWidth, maxHeight;
 
     // load the image and compute the ratio of the old height
     // to the new height, clone it, and resize it
     // document.jpg ~ document7.jpg
     image = imread("../images/document.jpg");
     image.copyTo(orig);
-    float r = (float) (800.0 / image.rows);
+    r = (float) (800.0 / image.rows);
     Size2f dim = Size2f(image.cols * r, 800);
     resize(image, image, dim, INTER_AREA);
 
@@ -350,7 +347,12 @@ void auto_scan_image() {
 
     // apply the four point transform to obtain a top-down
     // view of the original image
-    rect = order_points(screenContour);
+    vector<Point> newScreenContour;
+    for ( auto point : screenContour ) {
+        newScreenContour.emplace_back(Point((int) (point.x / r), (int) (point.y / r)));
+    }
+
+    rect = order_points(newScreenContour);
     topLeft     = rect[0];
     topRight    = rect[1];
     bottomRight = rect[2];
@@ -368,28 +370,229 @@ void auto_scan_image() {
     maxWidth = max(w1, w2);
     maxHeight = max(h1, h2);
 
-    cout << w1 << ":" << w2 << ":" << h1 << ":" << h2 << endl;
-
     pts2[0] = Point2f(0, 0);
     pts2[1] = Point2f(maxWidth - 1, 0);
     pts2[2] = Point2f(maxWidth - 1, maxHeight - 1);
     pts2[3] = Point2f(0, maxHeight - 1);
 
-    warp_mat = getPerspectiveTransform(pts1, pts2);
+    warpMat = getPerspectiveTransform(pts1, pts2);
 
-    warpPerspective(orig, warp_dst, warp_mat, Size2f(maxWidth, maxHeight));
+    warpPerspective(orig, warped, warpMat, Size2f(maxWidth, maxHeight));
 
     // show the original and scanned images
     cout << "STEP 3: Apply perspective transform" << endl;
-    imshow("Wraped", warp_dst);
+    imshow("Wraped", warped);
 
     waitKey(0);
     destroyAllWindows();
 
+    // convert the warped image to grayscale, then threshold it
+    // to give it that 'black and white' paper effect
+    cvtColor(warped, warped, COLOR_BGR2GRAY);
+    adaptiveThreshold(warped, warped, 255, ADAPTIVE_THRESH_MEAN_C, THRESH_BINARY, 21, 10);
 
+    // show the original and scanned images
+    cout << "STEP 4: Apply Adaptive Threshold" << endl;
+    imshow("Original", orig);
+    imshow("Scanned", warped);
+    imwrite("sannedImage.png", warped);
+
+    waitKey(0);
+    destroyAllWindows();
 }
 
+void auto_scan_image_via_webcam() {
 
+    Mat frame, gray, edged;
+
+    vector<vector<Point>> contours;
+    vector<Point> screenContour, rect;
+
+    VideoCapture cap(0);
+    if ( !cap.isOpened() ) {
+        cout << "cannot load camera!" << endl;
+        return;
+    }
+
+    while (true) {
+        cap.read(frame);
+
+        int k = waitKey(10);
+        if (k == 27) { break; }
+
+        // convert the image to grayscale, blur it, and find edges
+        // in the image
+        cvtColor(frame, gray, COLOR_BGR2GRAY);
+        GaussianBlur(gray, gray, Point(3, 3), 0);
+        Canny(gray, edged, 75, 200);
+
+        // show the original image and the edge detected image
+        cout << "STEP 1: Edge Detection" << endl;
+
+        // find the contours in the edged image, keeping only the
+        // largest ones, and initialize the screen contour
+        findContours(edged, contours, RETR_LIST, CHAIN_APPROX_SIMPLE);
+        sort(contours.rbegin(), contours.rend(), compareContourAreas);
+
+        // loop over the contours
+        for ( auto contour : contours ) {
+            // approximate the contour
+            vector<Point> approx;
+            double peri = arcLength(contour, true);
+            approxPolyDP(contour, approx, 0.02 * peri, true);
+
+            // if our approximated contour has four points, then we
+            // can assume that we have found our screen
+            if ( approx.size() == 4 ) {
+                double contourSize = contourArea(approx);
+                double camSize = frame.size().width * frame.size().height;
+                double ratio = contourSize / camSize;
+                cout << "contourSize : " << contourSize << ", camSize : " << camSize << ", ratio : " << ratio << endl;
+
+                if ( ratio > 0.1 ) {
+                    screenContour = approx;
+                }
+                break;
+            }
+        }
+
+        if ( screenContour.size() == 0 ) {
+            imshow("WebCam", frame);
+            continue;
+        } else {
+            // show the contour (outline) of the piece of paper
+            cout << "STEP 2: Find contours of paper" << endl;
+            vector<vector<Point>> contours;
+            contours.emplace_back(screenContour);
+            drawContours(frame, contours, -1, Scalar(0, 255, 0), 2);
+            imshow("WebCam", frame);
+        }
+    }
+    cap.release();
+    destroyAllWindows();
+}
+
+void auto_scan_image_via_webcam2() {
+
+    Mat frame, gray, edged, img;
+    Mat warpMat, warped;
+
+    vector<vector<Point>> contours;
+    vector<Point> screenContour, rect;
+
+    Point2f topLeft, topRight, bottomRight, bottomLeft;
+    Point2f pts1[4], pts2[4];
+
+    float r, w1, w2, h1, h2, maxWidth, maxHeight;
+
+    VideoCapture cap(0);
+    if ( !cap.isOpened() ) {
+        cout << "cannot load camera!" << endl;
+        return;
+    }
+
+    while (true) {
+        cap.read(frame);
+
+        int k = waitKey(10);
+        if (k == 27) { break; }
+
+        // convert the image to grayscale, blur it, and find edges
+        // in the image
+        cvtColor(frame, gray, COLOR_BGR2GRAY);
+        GaussianBlur(gray, gray, Point(3, 3), 0);
+        Canny(gray, edged, 75, 200);
+
+        // show the original image and the edge detected image
+        cout << "STEP 1: Edge Detection" << endl;
+
+        // find the contours in the edged image, keeping only the
+        // largest ones, and initialize the screen contour
+        findContours(edged, contours, RETR_LIST, CHAIN_APPROX_SIMPLE);
+        sort(contours.rbegin(), contours.rend(), compareContourAreas);
+
+        // loop over the contours
+        for ( auto contour : contours ) {
+            // approximate the contour
+            vector<Point> approx;
+            double peri = arcLength(contour, true);
+            approxPolyDP(contour, approx, 0.02 * peri, true);
+
+            // if our approximated contour has four points, then we
+            // can assume that we have found our screen
+            if ( approx.size() == 4 ) {
+                double contourSize = contourArea(approx);
+                double camSize = frame.size().width * frame.size().height;
+                double ratio = contourSize / camSize;
+                cout << "contourSize : " << contourSize << ", camSize : " << camSize << ", ratio : " << ratio << endl;
+
+                if ( ratio > 0.1 ) {
+                    screenContour = approx;
+                }
+                break;
+            }
+        }
+
+        if ( screenContour.size() == 0 ) {
+            imshow("WebCam", frame);
+            continue;
+        } else {
+            // show the contour (outline) of the piece of paper
+            cout << "STEP 2: Find contours of paper" << endl;
+            vector<vector<Point>> contours;
+            contours.emplace_back(screenContour);
+            drawContours(frame, contours, -1, Scalar(0, 255, 0), 2);
+            imshow("WebCam", frame);
+
+            frame.copyTo(img);
+
+            // apply the four point transform to obtain a top-down
+            // view of the original image
+            rect = order_points(screenContour);
+            topLeft     = rect[0];
+            topRight    = rect[1];
+            bottomRight = rect[2];
+            bottomLeft  = rect[3];
+
+            pts1[0] = rect[0];
+            pts1[1] = rect[1];
+            pts1[2] = rect[2];
+            pts1[3] = rect[3];
+
+            w1 = abs(bottomRight.x - bottomLeft.x);
+            w2 = abs(topRight.x - topLeft.x);
+            h1 = abs(topRight.y - bottomRight.y);
+            h2 = abs(topLeft.y - bottomLeft.y);
+            maxWidth = max(w1, w2);
+            maxHeight = max(h1, h2);
+
+            pts2[0] = Point(0, 0);
+            pts2[1] = Point((int) (maxWidth - 1), 0);
+            pts2[2] = Point((int) (maxWidth - 1), (int) (maxHeight - 1));
+            pts2[3] = Point(0, (int) (maxHeight - 1));
+
+            warpMat = getPerspectiveTransform(pts1, pts2);
+
+            warpPerspective(img, warped, warpMat, Size2f(maxWidth, maxHeight));
+
+            // show the original and scanned images
+            cout << "STEP 3: Apply perspective transform" << endl;
+
+            // convert the warped image to grayscale, then threshold it
+            // to give it that 'black and white' paper effect
+            cvtColor(warped, warped, COLOR_BGR2GRAY);
+            adaptiveThreshold(warped, warped, 255, ADAPTIVE_THRESH_MEAN_C, THRESH_BINARY, 21, 10);
+
+            // show the original and scanned images
+            cout << "STEP 4: Apply Adaptive Threshold" << endl;
+            break;
+        }
+    }
+    cap.release();
+    destroyWindow("WebCam");
+
+    imwrite("capture.png", warped);
+}
 
 int main() {
 
@@ -401,6 +604,8 @@ int main() {
 //    warp_perspective();
 //    global_threshold();
 //    adaptive_threshold();
-    auto_scan_image();
+//    auto_scan_image();
+//    auto_scan_image_via_webcam();
+    auto_scan_image_via_webcam2();
     return 0;
 }
